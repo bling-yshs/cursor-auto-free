@@ -1,10 +1,16 @@
+import base64
+import hashlib
 import os
 import platform
 import json
+import secrets
 import sys
+import uuid
+
+import requests
 from colorama import Fore, Style
 from enum import Enum
-from typing import Optional
+from typing import Optional, Tuple
 
 from exit_cursor import ExitCursor
 import go_cursor_help
@@ -163,45 +169,87 @@ def handle_turnstile(tab, max_retries: int = 2, retry_interval: tuple = (1, 2)) 
         save_screenshot(tab, "error")
         raise TurnstileError(error_msg)
 
-
-def get_cursor_session_token(tab, max_attempts=3, retry_interval=2):
+def get_cursor_session_token(tab, max_attempts: int = 3, retry_interval: int = 2) -> Optional[Tuple[str, str]]:
     """
-    Get Cursor session token with retry mechanism
-    :param tab: Browser tab
-    :param max_attempts: Maximum number of attempts
-    :param retry_interval: Retry interval (seconds)
-    :return: Session token or None
+    获取Cursor会话token
+    
+    Args:
+        tab: 浏览器标签页对象
+        max_attempts: 最大尝试次数
+        retry_interval: 重试间隔(秒)
+        
+    Returns:
+        Tuple[str, str] | None: 成功返回(userId, accessToken)元组，失败返回None
     """
-    logging.info(get_translation("getting_cookie"))
+    logging.info("开始获取会话令牌")
+    
+    # 首先尝试使用UUID深度登录方式
+    logging.info("尝试使用深度登录方式获取token")
+    
+    def _generate_pkce_pair():
+        """生成PKCE验证对"""
+        code_verifier = secrets.token_urlsafe(43)
+        code_challenge_digest = hashlib.sha256(code_verifier.encode('utf-8')).digest()
+        code_challenge = base64.urlsafe_b64encode(code_challenge_digest).decode('utf-8').rstrip('=')    
+        return code_verifier, code_challenge
+    
     attempts = 0
-
     while attempts < max_attempts:
         try:
-            cookies = tab.cookies()
-            for cookie in cookies:
-                if cookie.get("name") == "WorkosCursorSessionToken":
-                    return cookie["value"].split("%3A%3A")[1]
-
-            attempts += 1
-            if attempts < max_attempts:
-                logging.warning(
-                    get_translation("cookie_attempt_failed", attempts=attempts, retry_interval=retry_interval)
-                )
-                time.sleep(retry_interval)
+            verifier, challenge = _generate_pkce_pair()
+            id = uuid.uuid4()
+            client_login_url = f"https://www.cursor.com/cn/loginDeepControl?challenge={challenge}&uuid={id}&mode=login"
+            
+            logging.info(f"访问深度登录URL: {client_login_url}")
+            tab.get(client_login_url)
+            save_screenshot(tab, f"deeplogin_attempt_{attempts}")
+            
+            if tab.ele("xpath=//span[contains(text(), 'Yes, Log In')]", timeout=5):
+                logging.info("点击确认登录按钮")
+                tab.ele("xpath=//span[contains(text(), 'Yes, Log In')]").click()
+                time.sleep(1.5)
+                
+                auth_poll_url = f"https://api2.cursor.sh/auth/poll?uuid={id}&verifier={verifier}"
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Cursor/0.48.6 Chrome/132.0.6834.210 Electron/34.3.4 Safari/537.36",
+                    "Accept": "*/*"
+                }
+                
+                logging.info(f"轮询认证状态: {auth_poll_url}")
+                response = requests.get(auth_poll_url, headers=headers, timeout=5)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    accessToken = data.get("accessToken", None)
+                    authId = data.get("authId", "")
+                    
+                    if accessToken:
+                        userId = ""
+                        if len(authId.split("|")) > 1:
+                            userId = authId.split("|")[1]
+                        
+                        logging.info("成功获取账号token和userId")
+                        return userId, accessToken
+                else:
+                    logging.error(f"API请求失败，状态码: {response.status_code}")
             else:
-                logging.error(
-                    get_translation("cookie_max_attempts", max_attempts=max_attempts)
-                )
-
-        except Exception as e:
-            logging.error(get_translation("cookie_failure", error=str(e)))
+                logging.warning("未找到登录确认按钮")
+                
             attempts += 1
             if attempts < max_attempts:
-                logging.info(get_translation("retry_in_seconds", seconds=retry_interval))
-                time.sleep(retry_interval)
-
-    return None
-
+                wait_time = retry_interval * attempts  # 逐步增加等待时间
+                logging.warning(f"第 {attempts} 次尝试未获取到token，{wait_time}秒后重试...")
+                save_screenshot(tab, f"token_attempt_{attempts}")
+                time.sleep(wait_time)
+                
+        except Exception as e:
+            logging.error(f"深度登录获取token失败: {str(e)}")
+            attempts += 1
+            save_screenshot(tab, f"token_error_{attempts}")
+            if attempts < max_attempts:
+                wait_time = retry_interval * attempts
+                logging.warning(f"将在 {wait_time} 秒后重试...")
+                time.sleep(wait_time)
 
 def update_cursor_auth(email=None, access_token=None, refresh_token=None):
     """

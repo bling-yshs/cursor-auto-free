@@ -172,7 +172,6 @@ def handle_turnstile(tab, max_retries: int = 2, retry_interval: tuple = (1, 2)) 
 def get_cursor_session_token(tab, max_attempts: int = 3, retry_interval: int = 2) -> Optional[Tuple[str, str]]:
     """
     获取Cursor会话token
-    
     Args:
         tab: 浏览器标签页对象
         max_attempts: 最大尝试次数
